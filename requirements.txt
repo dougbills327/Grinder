@@ -1,2 +1,3 @@
 PyQt6>=6.6.0
 python-chess>=1.999
+pyqtgraph>=0.13.0

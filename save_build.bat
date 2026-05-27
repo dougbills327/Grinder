@@ -1,5 +1,5 @@
 @echo off
-SET VERSION=0.0.1
+SET VERSION=1.0.1
 cd /d D:\Grinder
 git add -A
 git commit -m "GRINDER v%VERSION%"

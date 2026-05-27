@@ -1,10 +1,11 @@
 [Setup]
 AppName=GRINDER
-AppVersion=0.0.1
+AppVersion=1.0.1
 AppPublisher=dougbills327
-DefaultDirName={autopf}\GRINDER
+DefaultDirName=D:\Grinder_1.0.1
 DefaultGroupName=GRINDER
-OutputBaseFilename=GRINDER_setup_v0.0.1
+OutputDir=installer_output
+OutputBaseFilename=GRINDER_setup_v1.0.1
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
