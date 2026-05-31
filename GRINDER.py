@@ -19,7 +19,7 @@ from PyQt6.QtCore import Qt, QSize, QByteArray
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush
 from PyQt6.QtSvgWidgets import QSvgWidget
 
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.1.2"
 APP_NAME = "GRINDER"
 
 # ---------------------------------------------------------------------------
@@ -262,6 +262,7 @@ def init_db(db_path):
         "ALTER TABLE positions ADD COLUMN folder_id INTEGER REFERENCES folders(id)",
         "ALTER TABLE folders ADD COLUMN parent_id INTEGER REFERENCES folders(id)",
         "ALTER TABLE games ADD COLUMN player_rating INTEGER",
+        "ALTER TABLE games ADD COLUMN playstyle TEXT",
     ]:
         try:
             cur.execute(stmt)
@@ -293,6 +294,30 @@ def db_update_position_title(db_path, position_id, title):
 def db_update_position_ideas(db_path, position_id, ideas):
     conn = get_db_connection(db_path)
     conn.execute("UPDATE positions SET ideas=? WHERE id=?", (ideas, position_id))
+    conn.commit()
+    conn.close()
+
+
+def db_delete_position(db_path, position_id):
+    conn = get_db_connection(db_path)
+    game_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM games WHERE position_id=?", (position_id,)
+    ).fetchall()]
+    for gid in game_ids:
+        conn.execute("DELETE FROM game_evals WHERE game_id=?", (gid,))
+        conn.execute("DELETE FROM postmortems WHERE game_id=?", (gid,))
+    conn.execute("DELETE FROM games WHERE position_id=?", (position_id,))
+    conn.execute("DELETE FROM positions WHERE id=?", (position_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_update_position(db_path, position_id, title, fen, ideas):
+    conn = get_db_connection(db_path)
+    conn.execute(
+        "UPDATE positions SET title=?, fen=?, ideas=? WHERE id=?",
+        (title, fen, ideas, position_id)
+    )
     conn.commit()
     conn.close()
 
@@ -380,12 +405,12 @@ def db_get_folders(db_path, parent_id=None):
     return rows
 
 
-def db_add_game(db_path, position_id, pgn, bot_name, bot_rating, result, max_advantage, min_eval, player_rating=None):
+def db_add_game(db_path, position_id, pgn, bot_name, bot_rating, result, max_advantage, min_eval, player_rating=None, playstyle=None):
     conn = get_db_connection(db_path)
     cur = conn.execute(
-        "INSERT INTO games (position_id, pgn, bot_name, bot_rating, result, max_advantage, min_eval, player_rating) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (position_id, pgn, bot_name, bot_rating, result, max_advantage, min_eval, player_rating)
+        "INSERT INTO games (position_id, pgn, bot_name, bot_rating, result, max_advantage, min_eval, player_rating, playstyle) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (position_id, pgn, bot_name, bot_rating, result, max_advantage, min_eval, player_rating, playstyle)
     )
     game_id = cur.lastrowid
     conn.commit()
@@ -396,7 +421,7 @@ def db_add_game(db_path, position_id, pgn, bot_name, bot_rating, result, max_adv
 def db_get_games(db_path, position_id):
     conn = get_db_connection(db_path)
     rows = conn.execute(
-        "SELECT id, position_id, pgn, bot_name, bot_rating, result, max_advantage, min_eval, date_played "
+        "SELECT id, position_id, pgn, bot_name, bot_rating, result, max_advantage, min_eval, date_played, player_rating, playstyle "
         "FROM games WHERE position_id=? ORDER BY date_played DESC, id DESC",
         (position_id,)
     ).fetchall()
@@ -463,6 +488,92 @@ def db_get_tier_stats(db_path, position_id, player_rating, upper_threshold, lowe
     return result
 
 
+def db_update_game_playstyle(db_path, game_id, playstyle):
+    conn = get_db_connection(db_path)
+    conn.execute("UPDATE games SET playstyle=? WHERE id=?", (playstyle, game_id))
+    conn.commit()
+    conn.close()
+
+
+def db_update_all_games_playstyle_for_bot(db_path, bot_name, playstyle):
+    """Update playstyle for all games played against a given bot."""
+    conn = get_db_connection(db_path)
+    conn.execute("UPDATE games SET playstyle=? WHERE bot_name=?", (playstyle, bot_name))
+    conn.commit()
+    conn.close()
+
+
+def db_get_playstyle_stats(db_path, position_id):
+    """Return win/loss/draw counts and ordered results list per playstyle."""
+    conn = get_db_connection(db_path)
+    rows = conn.execute(
+        "SELECT playstyle, result FROM games WHERE position_id=? ORDER BY date_played ASC, id ASC",
+        (position_id,)
+    ).fetchall()
+    conn.close()
+
+    styles = ["Guardian", "Observer", "Mediator", "Hunter", "Savage"]
+    stats = {s: {"total": 0, "wins": 0, "losses": 0, "draws": 0, "win_rate": 0, "results": []} for s in styles}
+    stats["Unknown"] = {"total": 0, "wins": 0, "losses": 0, "draws": 0, "win_rate": 0, "results": []}
+
+    for r in rows:
+        ps = r["playstyle"] if r["playstyle"] in styles else "Unknown"
+        stats[ps]["total"] += 1
+        stats[ps]["results"].append(r["result"])
+        if r["result"] == "WIN":    stats[ps]["wins"]   += 1
+        elif r["result"] == "LOSS": stats[ps]["losses"] += 1
+        elif r["result"] == "DRAW": stats[ps]["draws"]  += 1
+
+    for ps in stats:
+        t = stats[ps]["total"]
+        stats[ps]["win_rate"] = round(100 * stats[ps]["wins"] / t) if t else 0
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Bot Playstyle Lookup
+# ---------------------------------------------------------------------------
+
+PLAYSTYLES = ["Guardian", "Observer", "Mediator", "Hunter", "Savage"]
+BOT_PLAYSTYLES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_playstyles.json")
+
+
+def load_bot_playstyles():
+    if os.path.exists(BOT_PLAYSTYLES_FILE):
+        try:
+            with open(BOT_PLAYSTYLES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_bot_playstyles(data):
+    with open(BOT_PLAYSTYLES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def lookup_bot_playstyle(bot_name):
+    """Return playstyle string or None if unknown."""
+    data = load_bot_playstyles()
+    return data.get(bot_name)
+
+
+def register_bot_playstyle(bot_name, playstyle):
+    """Save a bot→playstyle mapping."""
+    data = load_bot_playstyles()
+    data[bot_name] = playstyle
+    save_bot_playstyles(data)
+
+
+def db_rename_folder(db_path, folder_id, new_name):
+    conn = get_db_connection(db_path)
+    conn.execute("UPDATE folders SET name=? WHERE id=?", (new_name, folder_id))
+    conn.commit()
+    conn.close()
+
+
 def db_save_evals(db_path, game_id, evals):
     """Save list of (move_number, eval_cp) tuples."""
     conn = get_db_connection(db_path)
@@ -507,198 +618,8 @@ def db_get_stats(db_path, position_id, upper_threshold, lower_threshold):
 
 
 # ---------------------------------------------------------------------------
-# Seed Data
+# Export / Import
 # ---------------------------------------------------------------------------
-
-def seed_data(db_path):
-    """Populate demo positions and games if DB is empty."""
-    conn = get_db_connection(db_path)
-    count = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
-    conn.close()
-    if count > 0:
-        return
-
-    positions = [
-        (
-            "Weak d5 Square Drill",
-            "r1bqkb1r/pp3ppp/2np1n2/4p3/2BPP3/2N2N2/PPP2PPP/R1BQK2R w KQkq - 0 7",
-            "Exploit the weak d5 square. Knight outpost on d5 is decisive.",
-        ),
-        (
-            "Rook Endgame — Active King",
-            "8/4pppp/8/4PPPP/8/k7/8/K7 w - - 0 1",
-            "King activity is everything. March the king to the center immediately.",
-        ),
-        (
-            "Bishop Pair Advantage",
-            "r1bqr1k1/pp3ppp/2pb1n2/3p4/3P4/2NBPN2/PPQ2PPP/R4RK1 w - - 0 12",
-            "Trade knights, keep bishops. Open the position with pawn breaks.",
-        ),
-    ]
-
-    import random
-    results_pool = ["WIN", "WIN", "WIN", "LOSS", "DRAW"]
-    bots = [("ChessBot3000", 1400), ("MidnightTactics", 1650), ("PawnStorm", 1200), ("EndgamePro", 1800)]
-
-    for title, fen, ideas in positions:
-        pos_id = db_add_position(db_path, title, fen, ideas, "")
-        for i in range(random.randint(4, 7)):
-            bot_name, bot_rating = random.choice(bots)
-            result = random.choice(results_pool)
-            max_adv = random.randint(300, 900) if result in ("WIN", "DRAW") else random.randint(100, 400)
-            min_ev = random.randint(-400, -50) if result in ("LOSS", "DRAW") else random.randint(-150, 50)
-            db_add_game(db_path, pos_id, f"[Event \"Training\"]\n1. e4 e5 *",
-                        bot_name, bot_rating, result, max_adv, min_ev)
-
-
-# ---------------------------------------------------------------------------
-# PGN Analysis
-# ---------------------------------------------------------------------------
-
-def analyze_pgn(pgn_text, position_fen, engine_path, engine_depth, engine_time_sec,
-                upper_threshold, lower_threshold, username="dab327"):
-    """
-    Parse PGN, validate FEN and username, analyze with engine.
-    Returns dict with: bot_name, bot_rating, player_rating, result, max_advantage, min_eval, pgn, evals
-    """
-    import chess
-    import chess.pgn
-    import chess.engine
-    import io
-
-    game = chess.pgn.read_game(io.StringIO(pgn_text))
-    if game is None:
-        raise ValueError("Could not parse PGN.")
-
-    # --- Validate FEN matches position ---
-    pgn_fen = game.headers.get("FEN", "").strip()
-    if not pgn_fen:
-        raise ValueError("PGN does not contain a FEN header. Make sure you copy the full PGN from Chessiverse.")
-
-    # Normalize both FENs for comparison (strip trailing fields that may differ)
-    def normalize_fen(f):
-        return " ".join(f.strip().split()[:4])
-
-    if normalize_fen(pgn_fen) != normalize_fen(position_fen):
-        raise ValueError(
-            f"PGN FEN does not match this position.\n\n"
-            f"Expected: {position_fen}\n\nGot: {pgn_fen}"
-        )
-
-    # --- Validate username is correct side ---
-    ok, start_board = validate_fen(position_fen)
-    if not ok:
-        raise ValueError("Invalid position FEN.")
-    player_is_white = start_board.turn == chess.WHITE
-
-    white_player = game.headers.get("White", "")
-    black_player = game.headers.get("Black", "")
-
-    if player_is_white and white_player.lower() != username.lower():
-        raise ValueError(
-            f"Expected {username} to play White in this position, "
-            f"but White is '{white_player}'."
-        )
-    if not player_is_white and black_player.lower() != username.lower():
-        raise ValueError(
-            f"Expected {username} to play Black in this position, "
-            f"but Black is '{black_player}'."
-        )
-
-    # --- Extract ratings ---
-    if player_is_white:
-        player_rating_str = game.headers.get("WhiteElo", "")
-        bot_rating_str    = game.headers.get("BlackElo", "")
-        bot_name          = black_player or "Unknown"
-    else:
-        player_rating_str = game.headers.get("BlackElo", "")
-        bot_rating_str    = game.headers.get("WhiteElo", "")
-        bot_name          = white_player or "Unknown"
-
-    try:
-        bot_rating = int(bot_rating_str)
-    except Exception:
-        bot_rating = None
-
-    try:
-        player_rating = int(player_rating_str)
-    except Exception:
-        player_rating = None
-
-    board = game.board()
-    moves = list(game.mainline_moves())
-
-    max_advantage = None
-    min_eval = None
-    result = "DRAW"
-    evals_list = []
-
-    try:
-        limit = chess.engine.Limit(depth=engine_depth) if engine_depth else chess.engine.Limit(time=engine_time_sec)
-        with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
-            for move in moves:
-                board.push(move)
-                info = engine.analyse(board, limit)
-                score = info["score"]
-                if player_is_white:
-                    cp = score.white().score(mate_score=10000)
-                else:
-                    cp = score.black().score(mate_score=10000)
-
-                evals_list.append(cp)
-
-                if cp is not None:
-                    if max_advantage is None or cp > max_advantage:
-                        max_advantage = cp
-                    if min_eval is None or cp < min_eval:
-                        min_eval = cp
-
-                    # Check threshold crossing — first one wins
-                    if result == "DRAW":
-                        if cp >= upper_threshold:
-                            result = "WIN"
-                        elif cp <= lower_threshold:
-                            result = "LOSS"
-
-    except Exception as e:
-        raise RuntimeError(f"Engine error: {e}")
-
-    return {
-        "bot_name": bot_name,
-        "bot_rating": bot_rating,
-        "player_rating": player_rating,
-        "result": result,
-        "max_advantage": max_advantage,
-        "min_eval": min_eval,
-        "pgn": pgn_text,
-        "evals": evals_list,
-    }
-
-
-def db_delete_position(db_path, position_id):
-    conn = get_db_connection(db_path)
-    # Get game ids first
-    game_ids = [r["id"] for r in conn.execute(
-        "SELECT id FROM games WHERE position_id=?", (position_id,)
-    ).fetchall()]
-    for gid in game_ids:
-        conn.execute("DELETE FROM game_evals WHERE game_id=?", (gid,))
-        conn.execute("DELETE FROM postmortems WHERE game_id=?", (gid,))
-    conn.execute("DELETE FROM games WHERE position_id=?", (position_id,))
-    conn.execute("DELETE FROM positions WHERE id=?", (position_id,))
-    conn.commit()
-    conn.close()
-
-
-def db_update_position(db_path, position_id, title, fen, ideas):
-    conn = get_db_connection(db_path)
-    conn.execute(
-        "UPDATE positions SET title=?, fen=?, ideas=? WHERE id=?",
-        (title, fen, ideas, position_id)
-    )
-    conn.commit()
-    conn.close()
-
 
 def db_export(db_path):
     """Export all data to a dict suitable for JSON serialisation."""
@@ -1529,6 +1450,9 @@ class PositionTree(QTreeWidget):
         menu.addAction("New Folder").triggered.connect(self._main_window().add_folder)
         if item and item.type() == FOLDER_ITEM_TYPE:
             menu.addSeparator()
+            menu.addAction("Rename Folder").triggered.connect(
+                lambda: self._main_window().rename_folder(item)
+            )
             menu.addAction("Delete Folder").triggered.connect(
                 lambda: self._main_window().delete_folder(item)
             )
@@ -1738,6 +1662,128 @@ class TierStatsWidget(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Playstyle Stats Widget
+# ---------------------------------------------------------------------------
+
+class PlaystyleStatsWidget(QWidget):
+    STYLE_COLORS = {
+        "Guardian": "#3a7bd5",
+        "Observer": "#8e44ad",
+        "Mediator": "#27ae60",
+        "Hunter":   "#e67e22",
+        "Savage":   "#e74c3c",
+        "Unknown":  "#95a5a6",
+    }
+    # Fixed column widths — must match header and data rows exactly
+    COL_WIDTHS = [("Playstyle", 90), ("G", 28), ("W", 28), ("L", 28), ("D", 28), ("Win%", 44)]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._n_form = 5
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(3)
+        self._rows = {}
+        self._build()
+
+    def set_n_form(self, n):
+        self._n_form = n
+
+    def _build(self):
+        # Header
+        header = QWidget()
+        header.setStyleSheet("background: transparent;")
+        h = QHBoxLayout(header)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        for text, width in self.COL_WIDTHS:
+            lbl = QLabel(text)
+            lbl.setFixedWidth(width)
+            lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #888; background: transparent;")
+            h.addWidget(lbl)
+        # Form header
+        form_lbl = QLabel("Form")
+        form_lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #888; background: transparent; margin-left: 6px;")
+        h.addWidget(form_lbl)
+        h.addStretch()
+        self._layout.addWidget(header)
+
+        for style in ["Guardian", "Observer", "Mediator", "Hunter", "Savage", "Unknown"]:
+            row = QWidget()
+            row.setStyleSheet("background: transparent;")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(0)
+            color = self.STYLE_COLORS.get(style, "#888")
+
+            name_lbl = QLabel(style)
+            name_lbl.setFixedWidth(self.COL_WIDTHS[0][1])
+            name_lbl.setStyleSheet(f"font-size: 12px; font-weight: bold; color: {color}; background: transparent;")
+            h.addWidget(name_lbl)
+
+            cols = {}
+            for col, (_, width) in zip(["total","wins","losses","draws","win_rate"], self.COL_WIDTHS[1:]):
+                lbl = QLabel("—")
+                lbl.setFixedWidth(width)
+                lbl.setStyleSheet("font-size: 12px; background: transparent;")
+                h.addWidget(lbl)
+                cols[col] = lbl
+
+            # Form dots container
+            form_container = QWidget()
+            form_container.setStyleSheet("background: transparent;")
+            form_h = QHBoxLayout(form_container)
+            form_h.setContentsMargins(6, 0, 0, 0)
+            form_h.setSpacing(3)
+            h.addWidget(form_container)
+            h.addStretch()
+
+            self._layout.addWidget(row)
+            self._rows[style] = {
+                "widget": row,
+                "cols": cols,
+                "form_h": form_h,
+                "form_container": form_container,
+            }
+
+    def _clear_form_dots(self, form_h):
+        while form_h.count():
+            item = form_h.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def update_stats(self, stats, n_form=None):
+        n = n_form or self._n_form
+        for style, data in stats.items():
+            if style not in self._rows:
+                continue
+            row = self._rows[style]
+            cols = row["cols"]
+            cols["total"].setText(str(data["total"]))
+            cols["wins"].setText(str(data["wins"]))
+            cols["losses"].setText(str(data["losses"]))
+            cols["draws"].setText(str(data["draws"]))
+            cols["win_rate"].setText(f"{data['win_rate']}%")
+
+            # Form dots — last n results oldest→newest
+            form_h = row["form_h"]
+            self._clear_form_dots(form_h)
+            results = data.get("results", [])
+            recent = results[-n:] if len(results) > n else results
+            for r in recent:
+                dot = FormCircle(r)
+                form_h.addWidget(dot)
+
+            row["widget"].setVisible(data["total"] > 0)
+
+    def clear(self):
+        for row in self._rows.values():
+            for lbl in row["cols"].values():
+                lbl.setText("—")
+            self._clear_form_dots(row["form_h"])
+
+
+# ---------------------------------------------------------------------------
 # Game History Widget
 # ---------------------------------------------------------------------------
 
@@ -1771,6 +1817,36 @@ class GameHistoryWidget(QWidget):
             parent=self
         )
         graph.exec()
+
+    def _set_playstyle(self, game_id, bot_name):
+        if not self._db_path_fn or not self._settings_fn:
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        styles = PLAYSTYLES
+        current_ps = ""
+        conn = get_db_connection(self._db_path_fn())
+        row = conn.execute("SELECT playstyle FROM games WHERE id=?", (game_id,)).fetchone()
+        conn.close()
+        if row and row["playstyle"]:
+            current_ps = row["playstyle"]
+
+        style, ok = QInputDialog.getItem(
+            self, "Set Playstyle", f"Playstyle for {bot_name}:",
+            styles, styles.index(current_ps) if current_ps in styles else 0, False
+        )
+        if ok and style:
+            if bot_name:
+                # Update all games for this bot across the entire database
+                db_update_all_games_playstyle_for_bot(self._db_path_fn(), bot_name, style)
+                register_bot_playstyle(bot_name, style)
+            else:
+                db_update_game_playstyle(self._db_path_fn(), game_id, style)
+            # Reload stats
+            if hasattr(self, '_reload_fn') and self._reload_fn:
+                self._reload_fn()
+
+    def set_reload_fn(self, fn):
+        self._reload_fn = fn
 
     def load_games(self, games):
         # Clear
@@ -1817,11 +1893,21 @@ class GameHistoryWidget(QWidget):
             date_lbl.setStyleSheet("font-size: 11px; color: #888; border: none; background: transparent;")
             h.addWidget(date_lbl)
 
+            # Playstyle tag
+            ps = g["playstyle"] if "playstyle" in g.keys() and g["playstyle"] else "?"
+            ps_btn = QPushButton(ps)
+            ps_btn.setFixedSize(80, 24)
+            ps_btn.setToolTip("Set playstyle")
+            ps_btn.setStyleSheet("font-size: 10px; padding: 0; border-radius: 3px; background-color: #b0c8e8; color: #1a1a2e;")
+            game_id = g["id"]
+            bot_name = g["bot_name"] or ""
+            ps_btn.clicked.connect(lambda _, gid=game_id, bn=bot_name: self._set_playstyle(gid, bn))
+            h.addWidget(ps_btn)
+
             graph_btn = QPushButton("📈")
             graph_btn.setFixedSize(28, 24)
             graph_btn.setToolTip("View Evaluation Graph")
             graph_btn.setStyleSheet("font-size: 13px; padding: 0; border-radius: 3px;")
-            game_id = g["id"]
             graph_btn.clicked.connect(lambda _, gid=game_id: self._show_graph(gid))
             h.addWidget(graph_btn)
 
@@ -1934,11 +2020,19 @@ class PositionDetailPanel(QWidget):
         tier_l.addWidget(self.tier_stats)
         detail_layout.addWidget(tier_group)
 
+        # Playstyle stats
+        playstyle_group = QGroupBox("Stats by Playstyle")
+        playstyle_l = QVBoxLayout(playstyle_group)
+        self.playstyle_stats = PlaystyleStatsWidget()
+        playstyle_l.addWidget(self.playstyle_stats)
+        detail_layout.addWidget(playstyle_group)
+
         # Game history
         games_group = QGroupBox("Games")
         games_l = QVBoxLayout(games_group)
         self.game_history = GameHistoryWidget()
         self.game_history.set_providers(db_path_fn, settings_fn)
+        self.game_history.set_reload_fn(self._reload_games)
         games_l.addWidget(self.game_history)
         detail_layout.addWidget(games_group)
 
@@ -1979,6 +2073,8 @@ class PositionDetailPanel(QWidget):
                              s.get("upper_threshold_cp", 500),
                              s.get("lower_threshold_cp", -200))
         self.stats_bar.update_stats(stats)
+        playstyle_data = db_get_playstyle_stats(db_path, self._current_pos_id)
+        self.playstyle_stats.update_stats(playstyle_data, n_form=s.get("form_games_shown", 5))
         tier_data = db_get_tier_stats(
             db_path, self._current_pos_id,
             s.get("player_rating", 1500),
@@ -2055,11 +2151,14 @@ class PositionDetailPanel(QWidget):
             s["player_rating"] = result["player_rating"]
             save_settings(s)
 
+        playstyle = lookup_bot_playstyle(result.get("bot_name", ""))
+
         game_id = db_add_game(
             self._get_db_path(), self._current_pos_id,
             result["pgn"], result["bot_name"], result["bot_rating"],
             result["result"], result["max_advantage"], result["min_eval"],
-            player_rating=result.get("player_rating")
+            player_rating=result.get("player_rating"),
+            playstyle=playstyle
         )
         if result.get("evals"):
             db_save_evals(self._get_db_path(), game_id, result["evals"])
@@ -2085,6 +2184,7 @@ class PositionDetailPanel(QWidget):
         self.detail_widget.setVisible(False)
         self.stats_bar.clear()
         self.tier_stats.clear()
+        self.playstyle_stats.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2096,7 +2196,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = load_settings()
         init_db(self.settings["db_path"])
-        seed_data(self.settings["db_path"])
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.setMinimumSize(1100, 700)
@@ -2290,6 +2389,14 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
         if ok and name.strip():
             db_add_folder(self.settings["db_path"], name.strip())
+            self._refresh_tree()
+
+    def rename_folder(self, folder_item):
+        folder_id = folder_item.data(0, ROLE_FOLDER_ID)
+        old_name = folder_item.text(0).replace("📁  ", "")
+        name, ok = QInputDialog.getText(self, "Rename Folder", "New name:", text=old_name)
+        if ok and name.strip() and name.strip() != old_name:
+            db_rename_folder(self.settings["db_path"], folder_id, name.strip())
             self._refresh_tree()
 
     def delete_folder(self, folder_item):
